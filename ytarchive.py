@@ -231,7 +231,7 @@ class DownloadInfo:
 
 # Fallback to get the player response object from the watch page HTML itself
 class WatchPageParser(HTMLParser):
-    player_response_text = ""
+    _json_decoder = json.JSONDecoder() # for more lenient raw_decode usage
 
     def handle_data(self, data):
         """
@@ -243,13 +243,13 @@ class WatchPageParser(HTMLParser):
         decl_start = data.find(INITIAL_PLAYER_RESPONSE_DECL)
         if decl_start < 0:
             return
-
-        logdebug("Found script element with player response in watch page.")
         obj_start = data.find("{", decl_start)
-        obj_end = data.find("};", obj_start) + 1
-
-        if obj_end > obj_start:
-            self.player_response_text = data[obj_start:obj_end]
+        if obj_start < 0:
+            return
+        player_response, _ = self._json_decoder.raw_decode(data[obj_start:])
+        if player_response:
+            logdebug("Found script element with player response in watch page.")
+            self.player_response = player_response
 
 
 #   Logging functions;
@@ -519,18 +519,11 @@ def get_player_response(info):
     watch_parser = WatchPageParser()
     watch_parser.feed(watch_html)
 
-    if len(watch_parser.player_response_text) == 0:
+    if not watch_parser.player_response:
         logwarn("Player response not found in the watch page.")
         return None
 
-    player_response = json.loads(watch_parser.player_response_text)
-    
-    """else:
-        parsedinfo = urllib.parse.parse_qs(vinfo)
-        player_response = json.loads(parsedinfo["player_response"][0])
-    """
-
-    return player_response
+    return watch_parser.player_response
 
 
 def make_quality_list(formats):
