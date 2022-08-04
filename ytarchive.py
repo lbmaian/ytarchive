@@ -54,6 +54,7 @@ DTYPE_VIDEO = "video"
 DEFAULT_VIDEO_QUALITY = "best"
 RECHECK_TIME = 15
 FRAG_MAX_TRIES = 10
+FULL_MAX_TRIES = 3
 HOUR = 60 * 60
 BUF_SIZE = 8192
 WINDOWS = sys.platform in ["win32", "msys"]
@@ -473,25 +474,42 @@ def download_as_text(url):
     :param url:
     """
     data = b""
+    tries = 0
 
-    try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            data = resp.read()
-    except Exception as err:
-        logwarn("Failed to retrieve data from {0}: {1}".format(url, err))
-        return ""
+    while True:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = resp.read()
+                break
+        except Exception as err:
+            tries += 1
+            if tries < FULL_MAX_TRIES:
+                logdebug("Failed to retrieve data from {0}: {1}".format(url, err))
+                time.sleep(RECHECK_TIME)
+            else:
+                logwarn("Failed to retrieve data from {0}: {1}".format(url, err))
+                return ""
 
     return data.decode("utf-8")
 
 
 def download_thumbnail(url, fname):
-    try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            with open(fname, "wb") as f:
-                f.write(resp.read())
-    except Exception as err:
-        logwarn("Failed to download thumbnail: {0}".format(err))
-        return False
+    tries = 0
+
+    while True:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                with open(fname, "wb") as f:
+                    f.write(resp.read())
+                    break
+        except Exception as err:
+            tries += 1
+            if tries < FULL_MAX_TRIES:
+                logdebug("Failed to download thumbnail: {0}".format(err))
+                time.sleep(RECHECK_TIME)
+            else:
+                logwarn("Failed to download thumbnail: {0}".format(err))
+                return False
 
     return True
 
@@ -502,7 +520,7 @@ def get_player_response(info):
 
     :param info:
     """
-    #vinfo = download_as_text(INFO_URL.format(info.vid))
+    #vinfo = download_as_text(info, INFO_URL.format(info.vid))
     #parsedinfo = None
     player_response = None
 
@@ -1060,7 +1078,7 @@ def download_frags(data_type, info, seq_queue, data_queue, frag_files):
     :param frag_files:
     """
     url = info.mdl_info[data_type].download_url
-    tname = threading.current_thread().getName()
+    tname = threading.current_thread().name
 
     while not info.mdl_info[data_type].stopping:
         # Check if the user decided to cancel this download, and exit gracefully
@@ -1069,7 +1087,7 @@ def download_frags(data_type, info, seq_queue, data_queue, frag_files):
                 break
 
         tries = 0
-        full_retries = 3
+        full_retries = FULL_MAX_TRIES
         seq = -1
         max_seq = -1
         is_403 = False
