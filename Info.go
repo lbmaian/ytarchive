@@ -149,6 +149,8 @@ type DownloadInfo struct {
 	GVideoDDL   bool
 	FragFiles   bool
 	LiveURL     bool
+	AudioOnly   bool
+	VideoOnly   bool
 
 	Thumbnail       string
 	VideoID         string
@@ -202,6 +204,7 @@ func NewFormatInfo() FormatInfo {
 		"start_date":   "",
 		"publish_date": "",
 		"description":  "",
+		"url":          "",
 	}
 }
 
@@ -312,6 +315,12 @@ func (di *DownloadInfo) IsFinished(dataType string) bool {
 	return di.MDLInfo[dataType].Finished
 }
 
+func (di *DownloadInfo) GetTimeSinceUpdated() time.Duration {
+	di.RLock()
+	defer di.RUnlock()
+	return time.Since(di.LastUpdated)
+}
+
 func (fi FormatInfo) SetInfo(player_response *PlayerResponse) {
 	pmfr := player_response.Microformat.PlayerMicroformatRenderer
 	vid := player_response.VideoDetails.VideoID
@@ -392,12 +401,7 @@ func (di *DownloadInfo) GetGvideoUrl(dataType string) {
 	for {
 		gvUrl := GetUserInput(fmt.Sprintf("Please enter the %s url, or nothing to skip: ", dataType))
 		if len(gvUrl) == 0 {
-			if dataType != DtypeAudio {
-				return
-			} else {
-				fmt.Println("Audio URL must be given. Video-only downloading is not supported at this time.")
-				continue
-			}
+			return
 		}
 
 		newUrl, itag := ParseGvideoUrl(gvUrl, dataType)
@@ -438,9 +442,20 @@ func (di *DownloadInfo) ParseInputUrl() error {
 
 			di.VideoID = parsedQuery.Get("v")
 			return nil
-		} else if strings.HasPrefix(lowerPath, "/channel") && strings.HasSuffix(lowerPath, "live") {
+		} else if strings.HasPrefix(lowerPath, "/channel/") || strings.HasPrefix(lowerPath, "/c/") {
 			// The URL can be polled and the stream can change depending on what
 			// the channel schedules. Useful for set-and-forget
+			chanSlashIdx := strings.Index(lowerPath[1:], "/") + 1
+			noChanPath := lowerPath[chanSlashIdx:]
+
+			// Check if we were given the channel url on a sub page
+			// Remove that part from the URL so we can append /live to it after
+			if strings.LastIndex(noChanPath, "/") > 0 {
+				lastSlash := strings.LastIndex(di.URL, "/")
+				di.URL = di.URL[:lastSlash]
+			}
+
+			di.URL = fmt.Sprintf("%s/live", di.URL)
 			di.LiveURL = true
 			return nil
 		}
@@ -453,7 +468,10 @@ func (di *DownloadInfo) ParseInputUrl() error {
 		}
 
 		di.GVideoDDL = true
-		di.VideoID = strings.TrimSuffix(parsedQuery.Get("id"), ".1")
+		id := parsedQuery.Get("id")
+		dotIdx := strings.LastIndex(id, ".")
+		id = id[:dotIdx]
+		di.VideoID = id
 		di.FormatInfo["id"] = di.VideoID
 		sqIdx := strings.Index(di.URL, "&sq=")
 		itag, err := strconv.Atoi(parsedQuery.Get("itag"))
@@ -471,7 +489,7 @@ func (di *DownloadInfo) ParseInputUrl() error {
 				di.SetDownloadUrl(DtypeAudio, di.URL[:sqIdx]+"&sq=%d")
 			}
 
-			if len(di.GetDownloadUrl(DtypeVideo)) == 0 && di.Quality < 0 {
+			if len(di.GetDownloadUrl(DtypeVideo)) == 0 && !di.AudioOnly {
 				di.GetGvideoUrl(DtypeVideo)
 			}
 		} else {
@@ -479,7 +497,7 @@ func (di *DownloadInfo) ParseInputUrl() error {
 				di.SetDownloadUrl(DtypeVideo, di.URL[:sqIdx]+"&sq=%d")
 			}
 
-			if len(di.GetDownloadUrl(DtypeAudio)) == 0 {
+			if len(di.GetDownloadUrl(DtypeAudio)) == 0 && !di.VideoOnly {
 				di.GetGvideoUrl(DtypeAudio)
 			}
 		}
@@ -611,7 +629,7 @@ func (di *DownloadInfo) GetVideoInfo() bool {
 
 		for !found {
 			if len(selQaulities) == 0 {
-				selQaulities = GetQualityFromUser(qualities, false)
+				selQaulities = GetQualityFromUser(qualities, false, pr.VideoDetails.Title)
 			}
 
 			for _, q := range selQaulities {
@@ -623,7 +641,10 @@ func (di *DownloadInfo) GetVideoInfo() bool {
 
 				videoItag := VideoLabelItags[q]
 				aonly := videoItag.VP9 == AudioOnlyQuality
-				di.SetDownloadUrl(DtypeAudio, dlUrls[AudioItag])
+
+				if !di.VideoOnly {
+					di.SetDownloadUrl(DtypeAudio, dlUrls[AudioItag])
+				}
 
 				if aonly {
 					di.Quality = AudioOnlyQuality
@@ -666,7 +687,7 @@ func (di *DownloadInfo) GetVideoInfo() bool {
 		aonly := di.Quality == AudioOnlyQuality
 		_, audioOk := dlUrls[AudioItag]
 
-		if audioOk && IsFragmented(dlUrls[AudioItag]) {
+		if !di.VideoOnly && audioOk && IsFragmented(dlUrls[AudioItag]) {
 			di.SetDownloadUrl(DtypeAudio, dlUrls[AudioItag])
 		}
 
@@ -954,11 +975,7 @@ func (di *DownloadInfo) DownloadStream(dataType, dataFile string, progressChan c
 			}
 		}
 
-		if !downloading {
-			break
-		}
-
-		if len(dataToWrite) == 0 || !dataReceived {
+		if (len(dataToWrite) == 0 || !dataReceived) && downloading {
 			if !stopping && activeDownloads <= 0 {
 				LogDebug("%s: Somehow no active downloads and no data to write", logName)
 				LogDebug("%s: Fragment this happened at: %d", logName, curFrag)
@@ -977,7 +994,6 @@ func (di *DownloadInfo) DownloadStream(dataType, dataFile string, progressChan c
 
 		i := 0
 		for i < len(dataToWrite) && tries > 0 {
-
 			data := dataToWrite[i]
 			if data.Seq != curFrag {
 				i += 1
@@ -1073,13 +1089,13 @@ func (di *DownloadInfo) DownloadStream(dataType, dataFile string, progressChan c
 			dataToWrite = append(dataToWrite[:i], dataToWrite[i+1:]...)
 			tries = 10
 			i = 0
-
-			if stopping || !downloading {
-				continue
-			}
 		}
 
-		updateDelta := time.Since(di.LastUpdated)
+		if !downloading {
+			break
+		}
+
+		updateDelta := di.GetTimeSinceUpdated()
 		if !stopping && !di.IsUnavailable() && updateDelta > time.Hour {
 			di.GetVideoInfo()
 		}

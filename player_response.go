@@ -139,7 +139,7 @@ func GetPlayerResponseFromHtml(data []byte) []byte {
 				// Maybe add a LogTrace in the future for stuff like this
 				//LogDebug("Found script element with player response in watch page.")
 				objStart := bytes.Index(data[declStart:], []byte("{")) + declStart
-				objEnd := bytes.Index(data[objStart:], []byte("};")) + 1 + objStart
+				objEnd := bytes.LastIndex(data[objStart:], []byte("};")) + 1 + objStart
 
 				if objEnd > objStart {
 					objData = data[objStart:objEnd]
@@ -249,7 +249,8 @@ func (di *DownloadInfo) GetPlayerResponse(videoHtml []byte) (*PlayerResponse, er
 
 func (di *DownloadInfo) GetPlayablePlayerResponse() (retrieved int, pr *PlayerResponse, selectedQualities []string) {
 	firstWait := true
-	waitOnLiveURL := di.LiveURL && di.RetrySecs > 0
+	isLiveURL := di.LiveURL
+	waitOnLiveURL := isLiveURL && di.RetrySecs > 0
 	liveWaited := 0
 	var secsLate int
 	var err error
@@ -324,7 +325,6 @@ func (di *DownloadInfo) GetPlayablePlayerResponse() (retrieved int, pr *PlayerRe
 			LogError("If this is a members only stream, you provided a cookies.txt file, and the above 'logged in' status is not True, please try updating your cookies file.")
 			LogError("Also check if your cookies file includes '#HttpOnly_' in front of some lines. If it does, delete that part of those lines and try again.")
 
-			di.Live = false
 			di.Unavailable = true
 			if di.InProgress {
 				di.printStatusWithoutLock()
@@ -352,7 +352,7 @@ func (di *DownloadInfo) GetPlayablePlayerResponse() (retrieved int, pr *PlayerRe
 			if firstWait {
 				fmt.Println()
 				if len(selectedQualities) < 1 {
-					selectedQualities = GetQualityFromUser(VideoQualities, true)
+					selectedQualities = GetQualityFromUser(VideoQualities, true, pr.VideoDetails.Title)
 				}
 			}
 
@@ -423,9 +423,9 @@ func (di *DownloadInfo) GetPlayablePlayerResponse() (retrieved int, pr *PlayerRe
 
 		case PlayableOk:
 			// player response returned from /live does not include full information
-			if di.LiveURL {
+			if isLiveURL {
 				di.URL = fmt.Sprintf("https://www.youtube.com/watch?v=%s", di.VideoID)
-				di.LiveURL = false
+				isLiveURL = false
 				continue
 			}
 

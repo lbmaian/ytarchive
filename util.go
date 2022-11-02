@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -40,6 +41,11 @@ type Atom struct {
 	Length int
 }
 
+type FFMpegArgs struct {
+	Args     []string
+	FileName string
+}
+
 const (
 	LogleveError = iota
 	LogleveWarning
@@ -60,8 +66,15 @@ const (
 	NetworkIPv4         = "tcp4"
 	NetworkIPv6         = "tcp6"
 	DefaultPollTime     = 15
+	MinimumMonitorTime  = 30
+	DefaultMonitorTime  = 60
 	DefaultVideoQuality = "best"
 )
+
+// If we run into file length issues, chances are the max file name length is around 255 bytes.
+// Seems Go automatically converts to long paths for Windows so we only have to worry about the
+// actual file name.
+const MaxFileNameLength = 243 // 255 - len(".description")
 
 var (
 	HtmlVideoLinkTag = []byte(`<link rel="canonical" href="https://www.youtube.com/watch?v=`)
@@ -72,14 +85,7 @@ var (
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-	tr = &http.Transport{
-		DialContext:           DialContextOverride,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-	}
-	client = &http.Client{
-		Transport: tr,
-	}
+	client = DefaultClient()
 )
 
 var fnameReplacer = strings.NewReplacer(
@@ -151,6 +157,16 @@ func LogTrace(format string, args ...interface{}) {
 
 func DialContextOverride(ctx context.Context, network, addr string) (net.Conn, error) {
 	return networkOverrideDialer.DialContext(ctx, networkType, addr)
+}
+
+func DefaultClient() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = DialContextOverride
+	tr.ResponseHeaderTimeout = 10 * time.Second
+
+	return &http.Client{
+		Transport: tr,
+	}
 }
 
 // Remove any illegal filename chars
@@ -330,7 +346,7 @@ func ParseQualitySelection(formats []string, quality string) []string {
 }
 
 // Prompt the user to select a video quality
-func GetQualityFromUser(formats []string, waiting bool) []string {
+func GetQualityFromUser(formats []string, waiting bool, title string) []string {
 	var selQualities []string
 	qualities := MakeQualityList(formats)
 
@@ -342,6 +358,7 @@ func GetQualityFromUser(formats []string, waiting bool) []string {
 		)
 	}
 
+	fmt.Printf("Video Title: %s\n", title)
 	fmt.Printf("Available video qualities: %s\n", qualities)
 
 	for len(selQualities) < 1 {
@@ -531,7 +548,7 @@ func ContinueFragmentDownload(di *DownloadInfo, state *fragThreadState) bool {
 			di.GetVideoInfo()
 		}
 
-		if !di.IsLive() {
+		if !di.IsLive() || di.IsUnavailable() {
 			if state.Is403 {
 				if di.IsUnavailable() {
 					LogWarn("%s: Download link likely expired and stream is privated or members only, cannot coninue download", state.Name)
@@ -624,7 +641,7 @@ func TryDelete(fname string) {
 	}
 }
 
-// Call os.State and check if err is os.ErrNotExist
+// Call os.Stat and check if err is os.ErrNotExist
 // Unsure if the file is guaranteed to exist when err is not nil or os.ErrNotExist
 func Exists(file string) bool {
 	_, err := os.Stat(file)
@@ -676,7 +693,22 @@ func FormatFilename(format string, vals map[string]string) (string, error) {
 		fnameVals[k] = SterilizeFilename(v)
 	}
 
-	return FormatPythonMapString(format, fnameVals)
+	fstr, err := FormatPythonMapString(format, fnameVals)
+	if err != nil {
+		return fstr, err
+	}
+
+	fnameLen := len(filepath.Base(fstr))
+	if fnameLen > MaxFileNameLength {
+		LogWarn("Formatted filename is too long. Truncating the title to try and fix.")
+		bytesOver := fnameLen - MaxFileNameLength
+		title := fnameVals["title"]
+		truncateLen := len(title) - bytesOver
+		fnameVals["title"] = TruncateString(title, truncateLen)
+		fstr, err = FormatPythonMapString(format, fnameVals)
+	}
+
+	return fstr, err
 }
 
 // Case insensitive search. Naive linear
@@ -741,4 +773,125 @@ func GenerateSAPISIDHash(origin *url.URL) string {
 	sapisidHash = hex.EncodeToString(hashBytes[:])
 
 	return fmt.Sprintf("SAPISIDHASH %d_%s", now, sapisidHash)
+}
+
+// Truncate the given string to be no more than the given number of bytes.
+// Returned string may be less than maxBytes depending on the size of characters
+// in the given string.
+func TruncateString(s string, maxBytes int) string {
+	var b strings.Builder
+	r := strings.NewReader(s)
+	curLen := 0
+	b.Grow(r.Len())
+
+	for {
+		char, size, err := r.ReadRune()
+		if err != nil {
+			break
+		}
+
+		curLen += size
+		if curLen > maxBytes {
+			break
+		}
+
+		b.WriteRune(char)
+	}
+
+	return b.String()
+}
+
+func WriteMuxFile(muxFile, ffmpegCmd string) int {
+	fmt.Printf("Writing ffmpeg command to create the final file to %s\n", muxFile)
+	err := os.WriteFile(muxFile, []byte(ffmpegCmd), 0644)
+	if err != nil {
+		LogError("Error writing muxcmd file: %s", err.Error())
+		return 1
+	}
+
+	return 0
+}
+
+func GetFFmpegArgs(audioFile, videoFile, thumbnail, fileDir, fileName string, onlyAudio, onlyVideo bool) FFMpegArgs {
+	mergeFile := ""
+	ext := ""
+	ffmpegArgs := make([]string, 0, 12)
+	ffmpegArgs = append(ffmpegArgs,
+		"-hide_banner",
+		"-nostdin",
+		"-loglevel", "fatal",
+		"-stats",
+	)
+
+	if downloadThumbnail && !mkv {
+		ffmpegArgs = append(ffmpegArgs, "-i", thumbnail)
+	}
+
+	if mkv {
+		ext = "mkv"
+	} else if onlyAudio {
+		ext = "m4a"
+	} else {
+		ext = "mp4"
+	}
+
+	mergeCounter := 0
+	mergeFile = filepath.Join(fileDir, fmt.Sprintf("%s.%s", fileName, ext))
+	for Exists(mergeFile) && mergeCounter < 10 {
+		mergeCounter += 1
+		mergeFile = filepath.Join(fileDir, fmt.Sprintf("%s-%d.%s", fileName, mergeCounter, ext))
+	}
+
+	if !onlyVideo {
+		ffmpegArgs = append(ffmpegArgs, "-i", audioFile)
+	}
+
+	if !onlyAudio {
+		ffmpegArgs = append(ffmpegArgs, "-i", videoFile)
+		if !mkv {
+			ffmpegArgs = append(ffmpegArgs, "-movflags", "faststart")
+		}
+
+		if downloadThumbnail && !mkv {
+			ffmpegArgs = append(ffmpegArgs,
+				"-map", "0",
+				"-map", "1",
+			)
+
+			if !onlyVideo {
+				ffmpegArgs = append(ffmpegArgs, "-map", "2")
+			}
+		}
+	}
+
+	ffmpegArgs = append(ffmpegArgs, "-c", "copy")
+	if downloadThumbnail {
+		if mkv {
+			ffmpegArgs = append(ffmpegArgs,
+				"-attach", thumbnail,
+				"-metadata:s:t", "filename=cover_land.jpg",
+				"-metadata:s:t", "mimetype=image/jpeg",
+			)
+		} else {
+			ffmpegArgs = append(ffmpegArgs, "-disposition:v:0", "attached_pic")
+		}
+	}
+
+	if addMeta {
+		for k, v := range info.Metadata {
+			if len(v) > 0 {
+				ffmpegArgs = append(ffmpegArgs,
+					"-metadata",
+					fmt.Sprintf("%s=%s", strings.ToUpper(k), v),
+				)
+			}
+		}
+	}
+
+	ffmpegArgs = append(ffmpegArgs, mergeFile)
+
+	return FFMpegArgs{
+		Args:     ffmpegArgs,
+		FileName: mergeFile,
+	}
 }
